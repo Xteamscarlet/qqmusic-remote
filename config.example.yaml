@@ -1,0 +1,32 @@
+# QQ 音乐遥控配置模板
+# 复制本文件为 config.yaml 后按本机实际情况修改（config.yaml 不会提交到 Git）
+
+qqmusic:
+  # QQ 音乐主程序路径（本机注册表实测：E:\QQMusic\QQMusic.exe）
+  exe_path: "E:\\QQMusic\\QQMusic.exe"
+  # 进程名（不含 .exe）
+  process_name: "QQMusic"
+  # 启动后等待窗口出现的最长秒数
+  start_timeout: 20
+
+# 全局快捷键兜底通道（需在 QQ音乐 设置 -> 快捷键 中确认已开启并与此处一致）
+hotkeys:
+  play_pause: ["ctrl", "alt", "f5"]
+  next: ["ctrl", "alt", "right"]
+  prev: ["ctrl", "alt", "left"]
+  volume_up: ["ctrl", "alt", "up"]
+  volume_down: ["ctrl", "alt", "down"]
+
+# UI 自动化坐标校准值（由 calibrate 命令写入；坐标为屏幕绝对像素）
+# 屏幕缩放（DPI 缩放比例，如 1.25 / 1.5）
+screen_scale: 1.0
+coords:
+  search_box: null        # 主界面搜索框中心 [x, y]
+  search_first_result: null  # 搜索结果第一首歌曲的播放按钮 [x, y]
+  playlist_tab: null      # 搜索结果页"歌单"标签 [x, y]
+  playlist_first: null    # 歌单结果第一项 [x, y]
+  playlist_play_all: null # 歌单详情页"播放全部"按钮 [x, y]
+  play_mode_button: null  # 底栏播放模式按钮 [x, y]
+
+# 默认歌单名（指令"播放歌单"不带名字时使用）
+default_playlist: "新新歌单"

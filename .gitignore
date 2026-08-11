@@ -1,0 +1,15 @@
+# 本机真实配置（含个人路径与校准坐标），不提交
+config.yaml
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# WorkBuddy 工作区数据
+.workbuddy/
+
+# 日志
+*.log
+logs/
