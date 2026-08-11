@@ -58,9 +58,17 @@ def set_mode(target, cfg=None):
     ensure_running(cfg)
     activate_window(cfg)
 
+    # 窗口相对坐标实时换算（与 search 模块同一套逻辑，避免窗口移动后点偏）
+    from .search import _resolve
+
+    pos = _resolve(coord, cfg)
+    if pos is None:
+        print("[mode][错误] 播放模式按钮坐标格式异常，请重跑: python cli.py calibrate")
+        return False
+    x, y = pos
+
     target_kws = _MODE_KEYWORDS[target]
     current = _read_current_mode(cfg)
-    x, y = coord
     if current is None:
         pyautogui.click(x, y)
         print("[mode][提示] 无法读取当前模式，已点击一次；如不对请再说一次切换指令")
