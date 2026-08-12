@@ -9,7 +9,7 @@
   python cli.py mute                      静音切换
   python cli.py play_song "歌名"          搜索并播放歌曲
   python cli.py play_playlist [歌单名]    播放歌单（默认取 config 的 default_playlist）
-  python cli.py mode order|random|single  切换播放模式
+  python cli.py mode order|list|single|random  切换播放模式（顺序/列表循环/单曲/随机）
   python cli.py calibrate                 坐标校准向导
 """
 import sys

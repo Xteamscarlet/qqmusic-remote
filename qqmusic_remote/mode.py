@@ -1,93 +1,107 @@
 # -*- coding: utf-8 -*-
-"""播放模式切换：顺序播放 / 随机播放 / 单曲循环。
+"""播放模式切换：顺序播放(order) / 列表循环(list) / 单曲循环(single) / 随机播放(random)。
 
-底栏播放模式按钮是循环切换的（顺序 -> 随机 -> 单曲 -> 顺序...），
-先尝试用 UIA 读按钮提示文本判断当前模式；读不到时退化为"点一次切换一档"。
+底栏模式按钮的图标随当前模式变化（4 种状态），无法用一个模板定位，
+改用恒定的'上一首'按钮做锚点模板匹配，模式按钮在其左侧固定位图偏移处。
+点击后弹出菜单是独立浮层窗口（主窗 PrintWindow 截不到），
+在全屏截图上用菜单项模板（图标+文字，实采自真实菜单）匹配点击。
+菜单直选天然幂等：重复切换到同一模式无副作用，无需读取当前模式。
 """
+import os
+import tempfile
 import time
 
 import pyautogui
 
-from .controller import activate_window, ensure_running
+from . import vision
+from .controller import activate_window, ensure_front, ensure_running
+from .search import _match_template
 from .settings import load_config
 
-# 目标模式别名 -> QQ音乐提示文本关键字
-_MODE_KEYWORDS = {
-    "order": ["顺序", "列表循环"],
-    "random": ["随机"],
-    "single": ["单曲"],
+_ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+
+# '上一首'按钮锚点模板（图标恒定，不随模式变化）
+_BTN_PREV = os.path.join(_ASSETS, "btn_prev.png")
+# 模式按钮中心相对'上一首'中心的位图像素偏移（其左侧 90 像素）
+_MODE_BTN_OFFSET = (-90, 0)
+
+# 目标模式 -> (菜单项模板文件, 中文名)
+_MODE_MENU = {
+    "order": ("menu_order.png", "顺序播放"),
+    "list": ("menu_list.png", "列表循环"),
+    "single": ("menu_single.png", "单曲循环"),
+    "random": ("menu_random.png", "随机播放"),
 }
 
-# QQ音乐播放模式的循环顺序（用于估算要点几次）
-_MODE_CYCLE = ["顺序", "随机", "单曲"]
 
-
-def _read_current_mode(cfg):
-    """用 UIA 读底栏播放模式按钮的提示文本，返回命中的关键字或 None。"""
+def _find_mode_button(cfg):
+    """用'上一首'锚点定位底栏模式按钮，返回屏幕坐标 (x, y)；找不到返回 None。"""
+    cap = vision.capture_window(cfg)
+    if not cap:
+        return None
+    path, left, top, scale = cap
     try:
-        from pywinauto import Application
+        hit = _match_template(path, _BTN_PREV)
+    finally:
+        os.unlink(path)
+    if not hit:
+        print("[mode] 未匹配到底栏'上一首'锚点按钮")
+        return None
+    x, y, w, h, score = hit
+    cx = x + w / 2 + _MODE_BTN_OFFSET[0]
+    cy = y + h / 2 + _MODE_BTN_OFFSET[1]
+    sx = left + cx / scale
+    sy = top + cy / scale
+    print(f"[mode] 锚点置信度 {score:.2f}，模式按钮 -> ({sx:.0f}, {sy:.0f})")
+    return sx, sy
 
-        app = Application(backend="uia").connect(
-            path=cfg["qqmusic"]["process_name"] + ".exe", timeout=5
-        )
-        win = app.top_window()
-        for btn in win.descendants(control_type="Button"):
-            name = btn.window_text() or ""
-            for kw in _MODE_CYCLE:
-                if kw in name:
-                    print(f"[mode] UIA 读到当前播放模式: {name}")
-                    return kw
-    except Exception as e:
-        print(f"[mode] UIA 读取模式失败: {e}")
-    return None
+
+def _click_menu_item(template_name, desc):
+    """全屏截图模板匹配弹出菜单项并点击。
+
+    菜单是独立浮层窗口，主窗 PrintWindow 截不到，故截全屏；
+    菜单弹出时在最上层，点击前不能置前主窗（会把菜单关掉）。
+    """
+    shot = pyautogui.screenshot()
+    fd, path = tempfile.mkstemp(suffix=".png", prefix="qqmenu_")
+    os.close(fd)
+    shot.save(path)
+    try:
+        hit = _match_template(path, os.path.join(_ASSETS, template_name))
+    finally:
+        os.unlink(path)
+    if not hit:
+        print(f"[mode] 菜单中未匹配到: {desc}")
+        return False
+    x, y, w, h, score = hit
+    scale = vision._dpi_scale()
+    sx = (x + w / 2) / scale
+    sy = (y + h / 2) / scale
+    pyautogui.click(sx, sy)
+    print(f"[mode] 点击菜单项 {desc} -> ({sx:.0f}, {sy:.0f}) 置信度 {score:.2f}")
+    return True
 
 
 def set_mode(target, cfg=None):
-    """切换播放模式。target: order / random / single。
+    """切换播放模式。target: order(顺序播放) / list(列表循环) / single(单曲循环) / random(随机播放)。
 
-    能读到当前模式时按循环序计算点击次数；读不到时只点一次并提示用户确认。
+    流程：锚点定位模式按钮 -> 点击弹出菜单 -> 菜单项模板匹配点击目标项。
     """
     cfg = cfg or load_config()
-    if target not in _MODE_KEYWORDS:
-        print(f"[mode][错误] 未知模式: {target}，可选 order/random/single")
-        return False
-    coord = cfg.get("coords", {}).get("play_mode_button")
-    if not coord:
-        print("[mode][错误] 缺少播放模式按钮坐标，请先运行: python cli.py calibrate")
+    if target not in _MODE_MENU:
+        print(f"[mode][错误] 未知模式: {target}，可选 order/list/single/random")
         return False
     ensure_running(cfg)
     activate_window(cfg)
-
-    # 窗口相对坐标实时换算（与 search 模块同一套逻辑，避免窗口移动后点偏）
-    from .search import _resolve
-
-    pos = _resolve(coord, cfg)
+    pos = _find_mode_button(cfg)
     if pos is None:
-        print("[mode][错误] 播放模式按钮坐标格式异常，请重跑: python cli.py calibrate")
         return False
-    x, y = pos
-
-    target_kws = _MODE_KEYWORDS[target]
-    current = _read_current_mode(cfg)
-    if current is None:
-        pyautogui.click(x, y)
-        print("[mode][提示] 无法读取当前模式，已点击一次；如不对请再说一次切换指令")
-        return True
-
-    # 命中目标包含的关键字之一（顺序/列表循环都视作 order）
-    if any(kw in current for kw in target_kws):
-        print(f"[mode] 已是目标模式: {current}，无需切换")
-        return True
-
-    # 按循环序计算点击次数
-    try:
-        cur_idx = _MODE_CYCLE.index(current)
-    except ValueError:
-        cur_idx = 0
-    tgt_idx = 0 if target == "order" else (1 if target == "random" else 2)
-    clicks = (tgt_idx - cur_idx) % len(_MODE_CYCLE)
-    for i in range(clicks):
-        pyautogui.click(x, y)
-        time.sleep(0.4)
-    print(f"[mode] 已点击 {clicks} 次，切换到: {target}")
+    ensure_front(cfg)  # 物理点击前保证窗口在最前
+    pyautogui.click(pos[0], pos[1])
+    time.sleep(0.8)  # 等菜单弹出
+    tpl, desc = _MODE_MENU[target]
+    if not _click_menu_item(tpl, desc):
+        return False
+    time.sleep(0.3)
+    print(f"[mode] 已切换到: {desc}")
     return True
