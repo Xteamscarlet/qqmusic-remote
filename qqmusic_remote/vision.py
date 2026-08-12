@@ -16,6 +16,9 @@ from .controller import _enum_main_window
 
 _PS1 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ocr.ps1")
 
+# PrintWindow 标志：要求按完整内容重绘（Win 8.1+，对 DirectComposition 自绘窗口有效）
+_PW_RENDERFULLCONTENT = 2
+
 
 def _dpi_scale():
     """屏幕物理像素 / 逻辑像素 的缩放比（如 1.0 / 1.5）。
@@ -27,9 +30,48 @@ def _dpi_scale():
     return physical_w / logical_w if logical_w else 1.0
 
 
+def _print_window_image(hwnd, width, height):
+    """用 PrintWindow 把窗口本体离屏绘制到位图（被遮挡/不在前台也能截到真实内容）。
+
+    width/height 为位图物理像素尺寸。返回 PIL.Image；
+    绘制失败或得到全黑图（部分硬件加速自绘窗口不支持离屏绘制）时返回 None。
+    """
+    import win32gui
+    import win32ui
+    from PIL import Image
+
+    hwnd_dc = win32gui.GetWindowDC(hwnd)
+    mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
+    save_dc = mfc_dc.CreateCompatibleDC()
+    bitmap = win32ui.CreateBitmap()
+    bitmap.CreateCompatibleBitmap(mfc_dc, width, height)
+    save_dc.SelectObject(bitmap)
+    try:
+        ok = ctypes.windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), _PW_RENDERFULLCONTENT)
+        if not ok:
+            return None
+        info = bitmap.GetInfo()
+        bits = bitmap.GetBitmapBits(True)
+        img = Image.frombuffer(
+            "RGB", (info["bmWidth"], info["bmHeight"]), bits, "raw", "BGRX", 0, 1
+        ).copy()
+        # 全黑图 = 窗口内容没绘上来，视为失败走回退通道
+        if img.convert("L").getextrema()[1] < 8:
+            return None
+        return img
+    finally:
+        win32gui.DeleteObject(bitmap.GetHandle())
+        save_dc.DeleteDC()
+        mfc_dc.DeleteDC()
+        win32gui.ReleaseDC(hwnd, hwnd_dc)
+
+
 def capture_window(cfg):
     """截取完整模式主窗口图像。
 
+    优先用 PrintWindow 离屏绘制窗口本体（被其他窗口遮挡也能截到 QQ 音乐自己的内容）；
+    PrintWindow 失败或黑图时回退屏幕区域截图——该方式截的是屏幕像素，
+    必须先把窗口置前，否则会截到遮挡它的前景窗口。
     返回 (图片路径, 窗口左上角逻辑坐标 left, top, dpi 缩放比)；找不到窗口返回 None。
     """
     import win32gui
@@ -39,9 +81,26 @@ def capture_window(cfg):
         print("[vision] 未找到 QQ 音乐主窗口")
         return None
     left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    if left < -10000:
+        # 窗口处于最小化状态（坐标被系统移到离屏位置），先还原再取矩形
+        from .controller import activate_window
+
+        activate_window(cfg)
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
     scale = _dpi_scale()
-    # region 传逻辑坐标，实际截图像素需乘缩放比
-    shot = pyautogui.screenshot(region=(left, top, right - left, bottom - top))
+    # PrintWindow 位图按物理像素创建，与屏幕截图同一坐标尺度，
+    # 下游 word_to_screen 的 /scale 换算两种通道通用
+    width = max(1, int(round((right - left) * scale)))
+    height = max(1, int(round((bottom - top) * scale)))
+    shot = _print_window_image(hwnd, width, height)
+    if shot is None:
+        from .controller import activate_window
+
+        print("[vision] PrintWindow 不可用（失败或黑图），置前窗口后回退屏幕截图")
+        activate_window(cfg)
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        # region 传逻辑坐标，实际截图像素需乘缩放比
+        shot = pyautogui.screenshot(region=(left, top, right - left, bottom - top))
     fd, path = tempfile.mkstemp(suffix=".png", prefix="qqmusic_")
     os.close(fd)
     shot.save(path)
@@ -132,17 +191,20 @@ def merge_lines(words, y_tol=10):
     return merged
 
 
-def find_text_point(lines, keyword, left, top, scale, min_y=0, max_x=None):
+def find_text_point(lines, keyword, left, top, scale, min_y=0, max_x=None, min_x=None):
     """在合并行里找关键字，按字符比例插值返回其屏幕点击坐标（逻辑像素）。
 
     例：行文本'歌曲视频专辑歌单歌词'中找'歌单'，按其字符位置估算点击点。
     min_y: 排除相对窗口顶部该像素值以上的行（图像坐标，传入时记得乘 scale）。
     max_x: 只考虑行起点不超过该 x 的行（图像坐标），用于限定左侧导航栏等区域。
+    min_x: 只考虑行起点不低于该 x 的行（图像坐标），用于排除左侧导航栏等区域。
     """
     for ln in sorted(lines, key=lambda l: (l["y"], l["x"])):
         if ln["y"] < min_y:
             continue
         if max_x is not None and ln["x"] > max_x:
+            continue
+        if min_x is not None and ln["x"] < min_x:
             continue
         idx = ln["text"].find(keyword)
         if idx < 0 or not ln["text"]:
@@ -154,11 +216,12 @@ def find_text_point(lines, keyword, left, top, scale, min_y=0, max_x=None):
     return None
 
 
-def click_text(cfg, keyword, desc="", min_y_rel=0, max_x_rel=None):
+def click_text(cfg, keyword, desc="", min_y_rel=0, max_x_rel=None, min_x_rel=None):
     """截图 OCR 找文字并点击其中心，成功返回 True。
 
     min_y_rel: 只在相对窗口顶部该像素值以下的区域里找（排除搜索框等顶部干扰）。
     max_x_rel: 只找行起点在相对窗口左侧该像素值以内的文字（限定侧栏等区域）。
+    min_x_rel: 只找行起点不低于该像素值的文字（排除左栏，限定内容区）。
     """
     words, left, top, scale = scan_window(cfg)
     if words is None:
@@ -167,10 +230,14 @@ def click_text(cfg, keyword, desc="", min_y_rel=0, max_x_rel=None):
         merge_lines(words), keyword, left, top, scale,
         min_y=min_y_rel * scale,
         max_x=None if max_x_rel is None else max_x_rel * scale,
+        min_x=None if min_x_rel is None else min_x_rel * scale,
     )
     if pos is None:
         print(f"[vision] 未识别到文字: {keyword}")
         return False
+    from .controller import ensure_front
+
+    ensure_front(cfg)  # 物理点击前必须保证窗口在最前，否则落到遮挡窗口上
     pyautogui.click(pos[0], pos[1])
     print(f"[vision] 点击文字 {desc or keyword} -> ({pos[0]:.0f}, {pos[1]:.0f})")
     return True

@@ -5,16 +5,75 @@
 第一首歌名），直接点击识别到的位置，无需手工校准；
 识别失败时回退到 config.yaml 里的校准坐标（窗口相对偏移）。
 """
+import difflib
+import os
 import time
 
 import pyautogui
 import pyperclip
 
 from . import vision
+
+try:  # jieba 用于歌单名关键词切分（OCR 容错匹配），未装时退化为纯相似度匹配
+    import jieba
+except ImportError:
+    jieba = None
+
+# 歌单详情页'播放'按钮模板图（绿色按钮视觉特征稳定，比 OCR 文字更可靠）
+_BTN_PLAY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "btn_play.png")
+# 顶部搜索框模板图（放大镜+'搜索音乐'占位符，外观恒定；框内有残留文字时匹配不上属预期，
+# 此时靠 play_song 结束时的清空动作保证下次为空）
+_BOX_SEARCH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "box_search.png")
+
+
+def _match_template(image_path, template_path, threshold=0.75):
+    """在窗口截图里做模板匹配，命中返回 (图像 x, y, w, h, 置信度)，否则 None。"""
+    import cv2
+
+    hay = cv2.imread(image_path)
+    needle = cv2.imread(template_path)
+    if hay is None or needle is None:
+        return None
+    res = cv2.matchTemplate(hay, needle, cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, max_loc = cv2.minMaxLoc(res)
+    if max_val < threshold:
+        return None
+    h, w = needle.shape[:2]
+    return max_loc[0], max_loc[1], w, h, max_val
+
+
+def _click_play_button(cfg):
+    """点击歌单详情页的'播放'按钮（绿色按钮，模板匹配定位，不依赖 OCR 文字）。
+
+    在 PrintWindow 截的窗口本体位图上匹配（不依赖前台），命中换算屏幕坐标后
+    置前窗口再物理点击；匹配失败回退 OCR 文字（限内容区），再回退校准坐标。
+    """
+    cap = vision.capture_window(cfg)
+    if cap:
+        path, left, top, scale = cap
+        try:
+            hit = _match_template(path, _BTN_PLAY)
+        finally:
+            os.unlink(path)
+        if hit:
+            x, y, w, h, score = hit
+            sx = left + (x + w / 2) / scale
+            sy = top + (y + h / 2) / scale
+            ensure_front(cfg)  # 物理点击前保证窗口在最前
+            pyautogui.click(sx, sy)
+            print(f"[vision] 模板匹配点击播放按钮 -> ({sx:.0f}, {sy:.0f}) 置信度 {score:.2f}")
+            time.sleep(0.5)
+            return True
+        print("[vision] 模板未匹配到播放按钮，回退 OCR 文字识别")
+    if vision.click_text(cfg, "播放", "播放按钮", min_x_rel=250):
+        time.sleep(0.5)
+        return True
+    return _click_coord("playlist_play_all", "播放按钮", cfg)
 from .controller import (
     _enum_main_window,
     activate_window,
     current_song,
+    ensure_front,
     ensure_running,
 )
 from .settings import load_config, save_config
@@ -54,6 +113,7 @@ def _click_coord(key, desc, cfg):
     if pos is None:
         print(f"[search][错误] 视觉识别失败且缺少校准坐标({desc})，可运行: python cli.py calibrate")
         return False
+    ensure_front(cfg)  # 物理点击前保证窗口在最前
     pyautogui.click(pos[0], pos[1])
     print(f"[search] 点击校准坐标 {desc} -> ({pos[0]}, {pos[1]})")
     time.sleep(0.5)
@@ -76,49 +136,67 @@ def _learn_offset(cfg, key, sx, sy):
 
 
 def _focus_search_box(cfg):
-    """聚焦搜索框：OCR 识别'搜索'占位文字优先，失败用校准坐标。"""
-    words, left, top, scale = vision.scan_window(cfg)
-    if words:
-        lines = vision.merge_lines(words)
-        # 搜索框在窗口顶部区域（相对窗口顶部 130 像素以内）
-        top_lines = [l for l in lines if l["y"] < 130 * scale]
-        pos = vision.find_text_point(top_lines, "搜索", left, top, scale)
-        if pos:
-            pyautogui.click(pos[0], pos[1])
-            print(f"[vision] 点击搜索框 -> ({pos[0]:.0f}, {pos[1]:.0f})")
-            _learn_offset(cfg, "search_box", pos[0], pos[1])
+    """聚焦搜索框：模板匹配'放大镜+搜索音乐'占位符优先，失败用校准坐标。
+
+    搜索框外观恒定（放大镜图标+占位文字），模板匹配比 OCR 合并行插值可靠——
+    后者会把搜索框所在超宽行按字符比例插值，点到右侧'听歌识曲'图标上。
+    匹配成功后把点位按窗口相对偏移写回 config 供兜底。
+    """
+    cap = vision.capture_window(cfg)
+    if cap:
+        path, left, top, scale = cap
+        try:
+            hit = _match_template(path, _BOX_SEARCH)
+        finally:
+            os.unlink(path)
+        if hit:
+            x, y, w, h, score = hit
+            sx = left + (x + w / 2) / scale
+            sy = top + (y + h / 2) / scale
+            ensure_front(cfg)  # 物理点击前保证窗口在最前
+            pyautogui.click(sx, sy)
+            print(f"[vision] 模板匹配点击搜索框 -> ({sx:.0f}, {sy:.0f}) 置信度 {score:.2f}")
+            _learn_offset(cfg, "search_box", sx, sy)
             time.sleep(0.5)
             return True
-        print("[vision] 顶部区域未识别到'搜索'占位文字（可能框内已有文字），走校准坐标")
+        print("[vision] 模板未匹配到搜索框（可能框内有残留文字），走校准坐标")
     return _click_coord("search_box", "搜索框", cfg)
 
 
 def _click_first_song(cfg):
     """点击搜索结果的第一首歌（双击歌名播放）。
 
-    以列头'歌名'行为锚点，取其下方最近一行的左侧歌名位置双击。
+    以结果列表列头行为锚点（'歌名'二字，或'专辑+时长'特征组合，容忍 OCR 丢字），
+    取其下方最近一行的左侧歌名位置双击。结果页加载/OCR 有波动，
+    找不到锚点时等待重试一轮，仍失败才回退校准坐标。
     """
-    words, left, top, scale = vision.scan_window(cfg)
-    if words:
-        lines = vision.merge_lines(words)
-        anchor = None
-        for l in sorted(lines, key=lambda v: v["y"]):
-            if "歌名" in l["text"]:
-                anchor = l
-                break
-        if anchor:
-            rows = [l for l in lines if l["y"] > anchor["y"] + 15 * scale]
-            rows.sort(key=lambda v: (v["y"], v["x"]))
-            if rows:
-                row = rows[0]
-                cx = row["x"] + min(120 * scale, row["w"] * 0.3)
-                cy = row["y"] + row["h"] / 2
-                sx, sy = left + cx / scale, top + cy / scale
-                pyautogui.doubleClick(sx, sy)
-                print(f"[vision] 双击第一首歌 -> ({sx:.0f}, {sy:.0f}) 行文本: {row['text'][:30]!r}")
-                time.sleep(0.5)
-                return True
-        print("[vision] 未找到'歌名'列头或结果行")
+    for retry in range(2):
+        words, left, top, scale = vision.scan_window(cfg)
+        if words:
+            lines = vision.merge_lines(words)
+            anchor = None
+            for l in sorted(lines, key=lambda v: v["y"]):
+                t = l["text"]
+                if "歌名" in t or ("专辑" in t and "时长" in t):
+                    anchor = l
+                    break
+            if anchor:
+                rows = [l for l in lines if l["y"] > anchor["y"] + 15 * scale]
+                rows.sort(key=lambda v: (v["y"], v["x"]))
+                if rows:
+                    row = rows[0]
+                    cx = row["x"] + min(120 * scale, row["w"] * 0.3)
+                    cy = row["y"] + row["h"] / 2
+                    sx, sy = left + cx / scale, top + cy / scale
+                    ensure_front(cfg)  # 物理双击前保证窗口在最前
+                    pyautogui.doubleClick(sx, sy)
+                    print(f"[vision] 双击第一首歌 -> ({sx:.0f}, {sy:.0f}) 行文本: {row['text'][:30]!r}")
+                    time.sleep(0.5)
+                    return True
+        if retry == 0:
+            print("[vision] 未找到列头锚点，等待结果页加载后重试")
+            time.sleep(1.5)
+    print("[vision] 未找到'歌名'列头或结果行")
     return _click_coord("search_first_result", "第一首结果播放按钮", cfg)
 
 
@@ -230,6 +308,32 @@ def _click_play_all(cfg):
     return _click_coord("playlist_play_all", "播放全部按钮", cfg)
 
 
+def _clear_search_box(cfg):
+    """播放成功后清空搜索框残留文字，恢复'搜索'占位符可见。
+
+    残留文字会挡住占位符，导致下次搜索 OCR 定位不到搜索框、
+    只能走可能因窗口移动/缩放而失效的校准坐标。
+    清空后点击内容区让焦点离开搜索框（收起搜索建议下拉）。
+    """
+    coord = cfg.get("coords", {}).get("search_box")
+    pos = _resolve(coord, cfg) if coord else None
+    if pos is None:
+        return
+    import win32gui
+
+    ensure_front(cfg)
+    pyautogui.click(pos[0], pos[1])
+    time.sleep(0.3)
+    pyautogui.hotkey("ctrl", "a")
+    pyautogui.press("delete")
+    time.sleep(0.2)
+    hwnd, _ = _enum_main_window(cfg["qqmusic"]["process_name"])
+    if hwnd:
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        pyautogui.click(left + (right - left) // 2, top + (bottom - top) // 2)
+    print("[search] 已清空搜索框残留文字")
+
+
 def play_song(keyword, cfg=None):
     """搜索并播放指定歌曲（如 'Dream It Possible'）。
 
@@ -254,14 +358,78 @@ def play_song(keyword, cfg=None):
     print(f"[search] 已点播: {keyword}；当前播放: {song or '(未读到标题)'}")
     if song and keyword.lower().split()[0] not in song.lower():
         print("[search][提示] 当前曲目与点播关键字不符，可能点偏了")
+    _clear_search_box(cfg)  # 清空残留，保证下次搜索 OCR 能定位搜索框
     return True
 
 
-def _find_in_nav(cfg, name, max_scrolls=8):
-    """在左侧导航栏（自建/收藏歌单区）OCR 查找歌单名，找不到就滚动左栏继续找。
+def _similarity(a, b):
+    """两段文本的字符级相似度（0~1），用于 OCR 容错比较。"""
+    return difflib.SequenceMatcher(None, a, b).ratio()
 
-    左栏宽约 230 像素，只在这个区域内匹配，避免误点内容区同名文本。
-    找到返回屏幕坐标 (x, y)，找不到返回 None。
+
+def _name_keywords(name):
+    """歌单名关键词：jieba 分词取长度>=2 且非通用后缀的词（'新新歌单' -> ['新新']）。"""
+    if jieba is None:
+        return []
+    return [w for w in jieba.lcut(name) if len(w) >= 2 and w not in ("歌单",)]
+
+
+def _fuzzy_match_span(text, name, threshold=0.6):
+    """在文本中找与 name 最相似的子串（容忍 OCR 丢字/错字）。
+
+    优先级：精确包含 -> jieba 关键词包含 -> 滑动窗口逐子串算相似度。
+    命中返回 (子串起 idx, 子串止 idx, 相似度)，未命中返回 None。
+    """
+    if name in text:
+        i = text.index(name)
+        return i, i + len(name), 1.0
+    for kw in _name_keywords(name):
+        if kw in text:
+            i = text.index(kw)
+            return i, i + len(kw), 0.8
+    n = len(name)
+    best = None
+    # 窗口长度只许与 name 差 1 字：过短的子串（如'歌单'二字）分母小易误判
+    for size in range(max(2, n - 1), n + 3):
+        for i in range(0, max(0, len(text) - size) + 1):
+            r = _similarity(name, text[i:i + size])
+            if best is None or r > best[2]:
+                best = (i, i + size, r)
+    if best and best[2] >= threshold:
+        return best
+    return None
+
+
+def _fuzzy_find_point(lines, name, wleft, wtop, scale, threshold=0.6):
+    """在合并行里模糊查找 name，按命中子串的字符比例插值返回屏幕点击坐标。
+
+    合并行可能横跨整个窗口（同行内容区文字并入），必须按子串在行内的
+    字符位置插值，取相似度分数最高的命中。找不到返回 None。
+    """
+    best = None
+    for ln in sorted(lines, key=lambda l: (l["y"], l["x"])):
+        m = _fuzzy_match_span(ln["text"], name, threshold)
+        if not m:
+            continue
+        i0, i1, score = m
+        ratio = (i0 + i1) / 2 / max(1, len(ln["text"]))
+        cx = ln["x"] + ln["w"] * ratio
+        cy = ln["y"] + ln["h"] / 2
+        pos = (wleft + cx / scale, wtop + cy / scale)
+        if best is None or score > best[2]:
+            best = (pos[0], pos[1], score)
+    if best:
+        return best[0], best[1]
+    return None
+
+
+def _scroll_nav_and_find(cfg, name, max_scrolls=8):
+    """在当前歌单列表里模糊查找歌单名，找不到就悬停列表区大幅快滚继续找。
+
+    悬停点必须在页签之下的歌单列表区（窗口中部会被内容区接管滚轮）。
+    到底判定：连续两次截图左栏文本几乎不变（滚不动）即到底，返回 None。
+    左栏列表只取行起点 x<230 的行，避免误点内容区同名文本。
+    找到返回屏幕坐标 (x, y)。
     """
     import win32gui
 
@@ -269,21 +437,68 @@ def _find_in_nav(cfg, name, max_scrolls=8):
     if not hwnd:
         return None
     left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-    nav_cx, nav_cy = left + 100, (top + bottom) // 2  # 左栏中部，滚动时鼠标悬停处
+    nav_cx = left + 100
+    nav_cy = top + (bottom - top) * 0.85  # 左栏下部歌单列表区
 
+    last_sig = None
+    still = 0
     for attempt in range(max_scrolls + 1):
         words, wleft, wtop, scale = vision.scan_window(cfg)
-        if words:
-            for ln in vision.merge_lines(words):
-                if name in ln["text"] and ln["x"] < 230 * scale:
-                    cx = ln["x"] + ln["w"] / 2
-                    cy = ln["y"] + ln["h"] / 2
-                    return wleft + cx / scale, wtop + cy / scale
+        if not words:
+            return None
+        nav_lines = [l for l in vision.merge_lines(words) if l["x"] < 230 * scale]
+        pos = _fuzzy_find_point(nav_lines, name, wleft, wtop, scale)
+        if pos:
+            return pos
+        # 左栏文本签名与上次几乎相同 -> 滚不动了
+        sig = "|".join(l["text"] for l in sorted(nav_lines, key=lambda v: (v["y"], v["x"])))
+        if last_sig and _similarity(sig, last_sig) > 0.85:
+            still += 1
+            if still >= 2:
+                print("[vision] 左栏连续滚动内容无变化，判定已到底")
+                return None
+        else:
+            still = 0
+        last_sig = sig
         if attempt < max_scrolls:
+            ensure_front(cfg)  # 滚动是物理输入，先保证窗口在最前
             pyautogui.moveTo(nav_cx, nav_cy)
-            pyautogui.scroll(-4)  # 左栏向下滚一屏，继续找
+            time.sleep(0.3)  # 悬停片刻让自绘列表接管滚轮
+            pyautogui.scroll(-12)  # 大幅度快滚（歌单列表总长不大）
+            print(f"[vision] 左栏未见到 {name}，快滚后继续（第 {attempt + 1} 次）")
             time.sleep(0.8)
-            print(f"[vision] 左栏未见到 {name}，滚动后继续（第 {attempt + 1} 次）")
+    return None
+
+
+def _click_nav_tab(cfg, tab):
+    """点击左栏的分类页签（'自建歌单'/'收藏歌单'），OCR 模糊容错（如识别成'收歌单'）。"""
+    words, wleft, wtop, scale = vision.scan_window(cfg)
+    if not words:
+        return False
+    nav_lines = [l for l in vision.merge_lines(words) if l["x"] < 230 * scale]
+    pos = _fuzzy_find_point(nav_lines, tab, wleft, wtop, scale)
+    if pos:
+        ensure_front(cfg)  # 物理点击前保证窗口在最前
+        pyautogui.click(pos[0], pos[1])
+        print(f"[vision] 点击左栏分类页签 {tab} -> ({pos[0]:.0f}, {pos[1]:.0f})")
+        time.sleep(0.8)
+        return True
+    print(f"[vision] 未找到左栏分类页签: {tab}")
+    return False
+
+
+def _find_in_nav(cfg, name, max_scrolls=8):
+    """在左侧歌单列表查找歌单名：'自建歌单'与'收藏歌单'互斥，两个分类都找完才报没找到。
+
+    流程：点'自建歌单'页签 -> 快滚查找到底 -> 没找到则点'收藏歌单'页签
+    -> 再次快滚查找到底；两个分类都到底仍没有才返回 None。
+    找到返回屏幕坐标 (x, y)。
+    """
+    for tab in ("自建歌单", "收藏歌单"):
+        _click_nav_tab(cfg, tab)  # 页签点不到也在当前视图找一轮兜底
+        pos = _scroll_nav_and_find(cfg, name, max_scrolls)
+        if pos:
+            return pos
     return None
 
 
@@ -339,14 +554,15 @@ def play_playlist(name=None, cfg=None):
     activate_window(cfg)
     pos = _find_in_nav(cfg, name)
     if pos is None:
-        print(f"[search][错误] 左侧歌单栏滚到底也没找到: {name}，请确认歌单名")
+        print(f"[search][错误] 自建/收藏两个分类都找到底也没有: {name}，请确认歌单名")
         return False
+    ensure_front(cfg)  # 物理点击前保证窗口在最前
     pyautogui.click(pos[0], pos[1])
     print(f"[vision] 点击左栏歌单 {name} -> ({pos[0]:.0f}, {pos[1]:.0f})")
     time.sleep(1.5)
-    if not vision.click_text(cfg, "播放全部", "播放全部按钮"):
-        if not _click_coord("playlist_play_all", "播放全部按钮", cfg):
-            return False
+    # 详情页绿色'播放'按钮走模板匹配（内部含 OCR/校准坐标两级回退）
+    if not _click_play_button(cfg):
+        return False
     time.sleep(2.0)
     print(f"[search] 已播放歌单: {name}；当前播放: {current_song(cfg) or '(未读到标题)'}")
     return True

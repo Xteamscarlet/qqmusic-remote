@@ -52,10 +52,11 @@ def ensure_running(cfg=None):
 
 
 def _enum_main_window(process_name):
-    """枚举目标进程的所有可见窗口，挑出'完整模式主窗口'。
+    """枚举目标进程的所有窗口，挑出'完整模式主窗口'。
 
     QQ 音乐会同时挂多个窗口：精简模式小窗（标题以'精简模式'开头）、
-    完整模式主窗（面积大）。按面积最大且非精简模式的窗口为准。
+    完整模式主窗（面积大）。点 X 关主面板时主窗只是被隐藏（进程保留），
+    因此隐藏窗口也参与候选，由 activate_window 负责恢复显示。
     返回 (hwnd, title) 或 (None, None)。
     """
     import win32gui
@@ -76,23 +77,28 @@ def _enum_main_window(process_name):
     candidates = []
 
     def _cb(hwnd, _):
-        if not win32gui.IsWindowVisible(hwnd):
-            return
         _, pid = win32process.GetWindowThreadProcessId(hwnd)
         if pid not in pids:
             return
+        visible = win32gui.IsWindowVisible(hwnd)
         title = win32gui.GetWindowText(hwnd) or ""
         left, top, right, bottom = win32gui.GetWindowRect(hwnd)
         area = max(0, right - left) * max(0, bottom - top)
         is_mini = title.startswith("精简模式")
-        candidates.append((hwnd, title, area, is_mini))
+        # 隐藏窗口 rect 无效（面积 0），但有曲目标题的就是完整模式主窗
+        candidates.append((hwnd, title, area, is_mini, visible))
 
     win32gui.EnumWindows(_cb, None)
-    # 优先级：非精简模式 > 标题非空（主窗标题=当前曲目，空标题多为框架层）> 面积最大
-    candidates.sort(key=lambda c: (not c[3], bool(c[1].strip()), c[2]), reverse=True)
+    # 优先级：非精简模式 > 可见 > 标题非空 > 标题像曲目('歌名 - 歌手') > 面积最大。
+    # 隐藏窗口 rect 无效（面积不可信），'播放队列'等功能窗面积可能大于被隐藏的主窗，
+    # 靠' - '特征把真正的主窗顶上来。
+    candidates.sort(
+        key=lambda c: (not c[3], c[4], bool(c[1].strip()), " - " in c[1], c[2]),
+        reverse=True,
+    )
     if not candidates:
         return None, None
-    hwnd, title, area, is_mini = candidates[0]
+    hwnd, title, area, is_mini, visible = candidates[0]
     if is_mini:
         print("[controller][警告] 只找到精简模式小窗，坐标类操作可能失效，建议切回完整模式")
     return hwnd, title
@@ -144,6 +150,24 @@ def current_song(cfg=None):
     return title or ""
 
 
+def ensure_front(cfg=None):
+    """确保 QQ 音乐主窗口在最前（已是前台则跳过，避免多余置前动作带来的闪烁）。
+
+    所有物理输入（pyautogui 点击/滚动/键盘）前都必须调用：
+    PrintWindow 截图不依赖前台，但物理输入会落到遮挡窗口上。
+    """
+    import win32gui
+
+    cfg = cfg or load_config()
+    hwnd, _ = _enum_main_window(cfg["qqmusic"]["process_name"])
+    if not hwnd:
+        print("[controller][警告] 未找到 QQ 音乐窗口")
+        return False
+    if win32gui.GetForegroundWindow() == hwnd:
+        return True
+    return activate_window(cfg)
+
+
 def activate_window(cfg=None):
     """把 QQ 音乐完整模式主窗口提到前台并聚焦。
 
@@ -156,6 +180,14 @@ def activate_window(cfg=None):
         print("[controller][警告] 未找到 QQ 音乐窗口")
         return False
     try:
+        import win32con
+        import win32gui
+
+        if not win32gui.IsWindowVisible(hwnd):
+            # 主面板被点 X 隐藏（进程仍在），先恢复显示再置前
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            print("[controller] 完整模式主窗被隐藏，已恢复显示")
+            time.sleep(1.2)  # 等窗口布局完成
         _force_foreground(hwnd)
         time.sleep(0.6)
         print(f"[controller] 已聚焦窗口: {title!r}")
