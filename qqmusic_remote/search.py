@@ -166,11 +166,12 @@ def _focus_search_box(cfg):
 def _click_first_song(cfg):
     """点击搜索结果的第一首歌（双击歌名播放）。
 
-    以结果列表列头行为锚点（'歌名'二字，或'专辑+时长'特征组合，容忍 OCR 丢字），
-    取其下方最近一行的左侧歌名位置双击。结果页加载/OCR 有波动，
-    找不到锚点时等待重试一轮，仍失败才回退校准坐标。
+    以结果列表列头行为锚点（'歌名'二字，或'专辑+时长'特征组合，容忍 OCR 丢字）。
+    结果行必须排除：左栏导航行（x<=250，否则'我的音乐'会被误选）和
+    以'词'开头的歌词预览行。结果页加载/搜索建议下拉关闭需要时间，
+    找不到锚点时等待重试两轮，仍失败才回退校准坐标。
     """
-    for retry in range(2):
+    for retry in range(3):
         words, left, top, scale = vision.scan_window(cfg)
         if words:
             lines = vision.merge_lines(words)
@@ -181,7 +182,12 @@ def _click_first_song(cfg):
                     anchor = l
                     break
             if anchor:
-                rows = [l for l in lines if l["y"] > anchor["y"] + 15 * scale]
+                rows = [
+                    l for l in lines
+                    if l["y"] > anchor["y"] + 15 * scale
+                    and l["x"] > 250 * scale  # 排除左栏导航行
+                    and not l["text"].startswith("词")  # 排除歌词预览行
+                ]
                 rows.sort(key=lambda v: (v["y"], v["x"]))
                 if rows:
                     row = rows[0]
@@ -193,7 +199,7 @@ def _click_first_song(cfg):
                     print(f"[vision] 双击第一首歌 -> ({sx:.0f}, {sy:.0f}) 行文本: {row['text'][:30]!r}")
                     time.sleep(0.5)
                     return True
-        if retry == 0:
+        if retry < 2:
             print("[vision] 未找到列头锚点，等待结果页加载后重试")
             time.sleep(1.5)
     print("[vision] 未找到'歌名'列头或结果行")
@@ -311,26 +317,34 @@ def _click_play_all(cfg):
 def _clear_search_box(cfg):
     """播放成功后清空搜索框残留文字，恢复'搜索'占位符可见。
 
-    残留文字会挡住占位符，导致下次搜索 OCR 定位不到搜索框、
-    只能走可能因窗口移动/缩放而失效的校准坐标。
-    清空后点击内容区让焦点离开搜索框（收起搜索建议下拉）。
+    流程：点搜索框 -> Ctrl+A 全选 -> Delete 删除 -> Esc 收焦点并关掉建议下拉。
+    不能用'点击内容区空白'来收焦点——会误点结果区首行/热搜区，反而触发新内容。
     """
     coord = cfg.get("coords", {}).get("search_box")
     pos = _resolve(coord, cfg) if coord else None
     if pos is None:
         return
-    import win32gui
-
     ensure_front(cfg)
     pyautogui.click(pos[0], pos[1])
     time.sleep(0.3)
     pyautogui.hotkey("ctrl", "a")
     pyautogui.press("delete")
-    time.sleep(0.2)
-    hwnd, _ = _enum_main_window(cfg["qqmusic"]["process_name"])
-    if hwnd:
-        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-        pyautogui.click(left + (right - left) // 2, top + (bottom - top) // 2)
+    time.sleep(0.6)  # 删除后多等一会再 Esc，避免客户端吞键
+    pyautogui.press("esc")
+    time.sleep(0.3)
+    # Esc 后搜索框仍是 focus 态（占位符不显示，模板匹配不上）。
+    # 点'歌名/歌手'列头退出 focus：此时必在搜索结果页，列头必然存在、
+    # 好识别（OCR 文字），且列头点击至多触发排序、不会误播歌曲。
+    words, left, top, scale = vision.scan_window(cfg)
+    if words:
+        for l in sorted(vision.merge_lines(words), key=lambda v: v["y"]):
+            t = l["text"]
+            if "歌名" in t or ("专辑" in t and "时长" in t):
+                hpos = vision.find_text_point([l], "歌名", left, top, scale)
+                if hpos:
+                    pyautogui.click(hpos[0], hpos[1])
+                    print(f"[search] 点击列头退出搜索框 focus -> ({hpos[0]:.0f}, {hpos[1]:.0f})")
+                break
     print("[search] 已清空搜索框残留文字")
 
 
@@ -347,10 +361,12 @@ def play_song(keyword, cfg=None):
         return False
     pyautogui.hotkey("ctrl", "a")  # 清空原有搜索词
     _paste_text(keyword)
-    time.sleep(0.3)
+    time.sleep(0.5)  # 等搜索建议下拉刷新
+    pyautogui.press("esc")  # 关掉建议下拉，防止回车选中历史/推荐项
+    time.sleep(0.2)
     pyautogui.press("enter")
     print(f"[search] 已搜索: {keyword}，等待结果加载...")
-    time.sleep(2.5)
+    time.sleep(1.5)
     if not _click_first_song(cfg):
         return False
     time.sleep(2.0)
